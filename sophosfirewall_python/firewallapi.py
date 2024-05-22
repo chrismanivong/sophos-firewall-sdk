@@ -16,6 +16,7 @@ import requests
 import xmltodict
 import urllib3
 from jinja2 import Environment, FileSystemLoader
+from requests_toolbelt.multipart.encoder import MultipartEncoder
 
 
 urllib3.disable_warnings()
@@ -43,6 +44,18 @@ class SophosFirewallOperatorError(Exception):
 
 class SophosFirewallInvalidArgument(Exception):
     """Error raised when an invalid argument is specified"""
+
+
+class UploadFile:
+    """Class to represent a file to be uploaded"""
+
+    def __init__(self, name: str, content: bytes, mime_type: str):
+        self.name = name
+        self.content = content
+        self.mime_type = mime_type
+
+    def get_as_tuple(self):
+        return (self.name, self.content, self.mime_type)
 
 
 class SophosFirewall:
@@ -92,7 +105,7 @@ class SophosFirewall:
                 f"Invalid IP address provided - {ip_address}"
             ) from exc
 
-    def _post(self, xmldata: str) -> requests.Response:
+    def _post(self, xmldata: str, files: list = None) -> requests.Response:
         """Post XML request to the firewall returning response as a dict object
 
         Args:
@@ -103,13 +116,30 @@ class SophosFirewall:
             requests.Response object
         """
         headers = {"Accept": "application/xml"}
-        resp = requests.post(
-            self.url,
-            headers=headers,
-            data={"reqxml": xmldata},
-            verify=self.verify,
-            timeout=30,
-        )
+        
+        if files is not None:
+            data = {}
+            for file_name, file in files.items():
+                data[file_name] = file.get_as_tuple()
+
+            data["reqxml"] = xmldata
+            m = MultipartEncoder(fields=data)
+            headers["Content-Type"] = m.content_type
+            resp = requests.post(
+                self.url,
+                headers=headers,
+                data=m,
+                verify=self.verify,
+                timeout=30,
+            )
+        else:
+            resp = requests.post(
+                self.url,
+                headers=headers,
+                data={"reqxml": xmldata},
+                verify=self.verify,
+                timeout=30,
+            )
 
         resp_dict = xmltodict.parse(resp.content.decode())["Response"]
         if "Status" in resp_dict:
@@ -137,6 +167,7 @@ class SophosFirewall:
         filename: str,
         template_vars: dict,
         template_dir: str = None,
+        files: dict = None,
         debug: bool = False,
     ) -> dict:
         """Submits XML payload stored as a Jinja2 file
@@ -145,6 +176,7 @@ class SophosFirewall:
             filename (str): Jinja2 template filename. Place in "templates" directory or configure template_dir.
             template_vars (dict): Dictionary of variables to inject into the template. Username and password are passed in by default.
             template_dir (str): Directory to look for templates. Default is "./templates".
+            files: (list, optional): List of files to upload. Defaults to None.
             debug (bool, optional): Enable debug mode to display XML payload. Defaults to False.
 
         Returns:
@@ -166,7 +198,7 @@ class SophosFirewall:
         payload = template.render(**template_vars)
         if debug:
             print(f"REQUEST: {payload}")
-        resp = self._post(xmldata=payload)
+        resp = self._post(xmldata=payload, files=files)
 
         resp_dict = xmltodict.parse(resp.content.decode())["Response"]
         success_pattern = "2[0-9][0-9]"
@@ -1530,4 +1562,94 @@ class SophosFirewall:
             "updateserviceacl.j2", template_vars=template_vars, debug=debug
         )
 
+        return resp
+
+    def get_certificate(self, name: str):
+        """Get certificate details.
+
+        Args:
+            name (str): Name of the certificate.
+
+        Returns:
+            dict: XML response converted to Python dictionary
+        """
+        return self.get_tag_with_filter(xml_tag="Certificate", key="Name", value=name)
+
+    def upload_certificate(self, cert_name,
+                           cert_file: str,
+                           key_file: str = "",
+                           password: str = None,
+                           mode: str = 'set',
+                           debug: bool = False):
+        """
+        Uploads a certificate and key to the firewall.
+
+        Args:
+            cert_name (str): The name of the certificate.
+            cert_file (str): The path to the certificate file.
+            key_file (str, optional): The path to the key file.
+            password (str, optional): The password for the cert/key file. Defaults to "".
+            debug (bool, optional): Whether to enable debug mode. Defaults to False.
+
+        Returns:
+            dict: The response from the firewall.
+
+        Raises:
+            FileNotFoundError: If the certificate or key file is not found.
+        """
+
+        files = {}
+        template_vars = {"name": cert_name, "mode": mode}
+        template_dir = os.path.join(os.path.dirname(__file__), 'templates')
+        if cert_file.split('.')[-1] not in ["pem", "crt", "pfx", "p12"]:
+            raise ValueError(f'Invalid certificate file format: {cert_file}')
+
+        if not os.path.exists(cert_file):
+            raise FileNotFoundError(f'Certificate file not found: {cert_file}')
+
+        cert = UploadFile(
+            os.path.basename(cert_file),
+            open(cert_file, 'rb').read(),
+            'text/plain')
+        template_vars['certfile_filename'] = cert.name
+        files['Certificate'] = cert
+
+        if (key_file != "" and 
+            cert_file.split('.')[-1] == "pem" and 
+                key_file.split('.')[-1] == "pem"):
+
+            template_vars['format'] = 'pem'
+
+            if not os.path.exists(key_file):
+                raise FileNotFoundError(f'Key file not found: {key_file}')
+
+            key = UploadFile(
+                re.sub(r'\.pem$', '.key', os.path.basename(key_file)),
+                open(key_file, 'rb').read(),
+                'text/plain')
+
+            template_vars['keyfile_filename'] = key.name
+            files['Private key'] = key
+
+            if password is not None:
+                template_vars['keyfile_password'] = password
+
+        elif (key_file == "" and
+              cert_file.split('.')[-1] == "pfx" or
+              cert_file.split('.')[-1] == "p12"):
+
+            template_vars['format'] = 'pfx'
+
+            if password is None:
+                raise ValueError('Password must be provided for PFX/P12 files')
+
+            template_vars['password'] = password
+
+        resp = self.submit_template(
+            'uploadcertificate.j2',
+            template_vars=template_vars,
+            template_dir=template_dir,
+            files=files,
+            debug=debug
+        )
         return resp

@@ -1,0 +1,20 @@
+<Request>
+    <Login>
+        <Username>{{username}}</Username>
+        <Password>{{password}}</Password>
+    </Login>
+    <Set operation = "{{mode}}">
+        <Certificate transactionid="">
+            <Name>{{name}}</Name>
+            <Action>UploadCertificate</Action>
+            <CertificateFormat>{{format}}</CertificateFormat>
+            <CertificateFile>{{certfile_filename}}</CertificateFile>
+            {% if keyfile_filename %}
+            <PrivateKeyFile>{{keyfile_filename}}</PrivateKeyFile>
+            {% endif %}
+            {% if keyfile_password %}
+            <Password>{{keyfile_password}}</Password>
+            {% endif %}
+        </Certificate>
+    </Set>
+</Request>
